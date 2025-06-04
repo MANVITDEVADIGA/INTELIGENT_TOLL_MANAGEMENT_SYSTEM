@@ -21,12 +21,11 @@ void loop() {
   while (GPSserial.available() > 0) {
     char c = GPSserial.read();
     gps.encode(c);
-    Serial.print("[Step 4] Received char: ");
-    Serial.println(c);
+    Serial.print(c);  // Print raw NMEA character
   }
 
   if (gps.location.isUpdated()) {
-    Serial.println("[Step 5] GPS location updated.");
+    Serial.println("\n[Step 5] GPS location updated.");
     Serial.print("Latitude: ");
     Serial.println(gps.location.lat(), 6);
     Serial.print("Longitude: ");
@@ -42,5 +41,5 @@ void loop() {
     Serial.println("[Step 6] No new location data.");
   }
 
-  delay(10000);  // Delay for readability
+  delay(1000);  // Delay for readability
 }
