@@ -1,0 +1,796 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <espnow.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const char* ssid = "S20";
+const char* password = "87654321";
+
+IPAddress local_IP(192, 168, 1, 100);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+ESP8266WebServer server(80);
+
+#pragma pack(push,1)
+struct TxPacket {
+  char vehicle_id[16];
+  char fastag[32];
+  double total_distance_m;
+  uint32_t seq;
+};
+#pragma pack(pop)
+
+struct VehicleData {
+  char vehicle_id[16];
+  char fastag[32];
+  double total_distance_m;
+  uint32_t seq;
+  unsigned long last_update_ms;
+  bool is_active;
+};
+
+const int MAX_VEHICLES = 10;
+VehicleData vehicles[MAX_VEHICLES];
+int vehicle_count = 0;
+const double RATE_PER_KM = 5.0;
+
+const char* web_username = "admin";
+const char* web_password = "admin123";
+
+bool isAuthenticated = false;
+String sessionToken = "";
+
+struct DisplayState {
+  bool show_data;
+  unsigned long display_time;
+  int display_index;
+};
+DisplayState dstate = {false, 0, -1};
+
+void initOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("SSD1306 allocation failed");
+    for(;;);
+  }
+  
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.clearDisplay();
+  display.setCursor(10, 25);
+  display.println("Vehicle Tracker");
+  display.setCursor(20, 40);
+  display.println("Initializing...");
+  display.display();
+  delay(2000);
+}
+
+void displayWaiting() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10);
+  display.println("Waiting for");
+  display.setCursor(20, 35);
+  display.println("Data...");
+  display.setTextSize(1);
+  display.setCursor(30, 58);
+  display.println("Listening ESP-NOW");
+  display.display();
+}
+
+void displayReceivedData(int idx) {
+  if (idx < 0 || idx >= vehicle_count) return;
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  display.println("DATA RECEIVED!");
+  
+  display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
+  
+  display.setCursor(0, 12);
+  display.print("ID: ");
+  display.println(vehicles[idx].vehicle_id);
+  
+  display.setCursor(0, 22);
+  display.print("Distance: ");
+  double dist_km = vehicles[idx].total_distance_m / 1000.0;
+  display.print(dist_km, 2);
+  display.println(" km");
+  
+  double fare = dist_km * RATE_PER_KM;
+  display.setCursor(0, 32);
+  display.print("Amount: ");
+  display.print("Rs.");
+  display.println(fare, 0);
+  
+  display.drawLine(0, 42, 127, 42, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(20, 48);
+  display.println("TRANSACTION");
+  display.setCursor(28, 58);
+  display.println("SUCCESSFUL");
+  
+  display.display();
+}
+
+int findVehicle(const char* vehicle_id) {
+  for (int i = 0; i < vehicle_count; i++) {
+    if (strcmp(vehicles[i].vehicle_id, vehicle_id) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void updateVehicleData(const TxPacket &pkt) {
+  int idx = findVehicle(pkt.vehicle_id);
+  
+  if (idx == -1) {
+    if (vehicle_count < MAX_VEHICLES) {
+      idx = vehicle_count;
+      vehicle_count++;
+      Serial.printf("NEW VEHICLE >> %s (Total: %d)\n", pkt.vehicle_id, vehicle_count);
+    } else {
+      Serial.println("MAX VEHICLES REACHED");
+      return;
+    }
+  }
+  
+  strncpy(vehicles[idx].vehicle_id, pkt.vehicle_id, sizeof(vehicles[idx].vehicle_id)-1);
+  vehicles[idx].vehicle_id[sizeof(vehicles[idx].vehicle_id)-1] = '\0';
+  
+  strncpy(vehicles[idx].fastag, pkt.fastag, sizeof(vehicles[idx].fastag)-1);
+  vehicles[idx].fastag[sizeof(vehicles[idx].fastag)-1] = '\0';
+  
+  vehicles[idx].total_distance_m = pkt.total_distance_m;
+  vehicles[idx].seq = pkt.seq;
+  vehicles[idx].last_update_ms = millis();
+  vehicles[idx].is_active = true;
+  
+  dstate.show_data = true;
+  dstate.display_time = millis();
+  dstate.display_index = idx;
+  
+  Serial.printf("UPDATE >> %s | Distance: %.2f km | Seq: %u\n", 
+    pkt.vehicle_id, pkt.total_distance_m / 1000.0, pkt.seq);
+}
+
+void onDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
+  if (len < (int)sizeof(TxPacket)) {
+    Serial.printf("Invalid packet size: %d\n", len);
+    return;
+  }
+  
+  const TxPacket* pkt = (const TxPacket*)incomingData;
+  updateVehicleData(*pkt);
+}
+
+const char HTML_LOGIN[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vehicle Tracker - Login</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: gradient 15s ease infinite;
+      background-size: 200% 200%;
+    }
+    @keyframes gradient {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    .login-container {
+      background: white;
+      padding: 40px;
+      border-radius: 20px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      width: 90%;
+      max-width: 400px;
+      animation: slideIn 0.6s ease-out;
+    }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(-20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .logo {
+      width: 80px;
+      height: 80px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-radius: 50%;
+      margin: 0 auto 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 36px;
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    h1 {
+      text-align: center;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 10px;
+      font-size: 28px;
+    }
+    .subtitle {
+      text-align: center;
+      color: #666;
+      margin-bottom: 30px;
+      font-size: 14px;
+    }
+    .input-group {
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: #333;
+      font-weight: 500;
+      font-size: 14px;
+    }
+    input {
+      width: 100%;
+      padding: 12px 15px;
+      border: 2px solid #e0e0e0;
+      border-radius: 10px;
+      font-size: 14px;
+      transition: all 0.3s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    .btn {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+      margin-top: 10px;
+    }
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+    }
+    .error {
+      background: #fee;
+      border: 1px solid #fcc;
+      color: #c33;
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      font-size: 14px;
+      display: none;
+    }
+    .demo-creds {
+      background: #e3f2fd;
+      padding: 15px;
+      border-radius: 10px;
+      margin-top: 20px;
+      text-align: center;
+      font-size: 12px;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="logo">🚗</div>
+    <h1>Vehicle NH Tracker</h1>
+    <p class="subtitle">Login to access dashboard</p>
+    <div id="error" class="error"></div>
+    <div class="input-group">
+      <label>Username</label>
+      <input type="text" id="username" placeholder="Enter username" autocomplete="username">
+    </div>
+    <div class="input-group">
+      <label>Password</label>
+      <input type="password" id="password" placeholder="Enter password" autocomplete="current-password">
+    </div>
+    <button class="btn" onclick="login()">Login</button>
+    <div class="demo-creds">
+      <strong>Demo Credentials:</strong><br>
+      Username: admin | Password: admin123
+    </div>
+  </div>
+  <script>
+    document.getElementById('password').addEventListener('keypress', function(e) {
+      if (e.key === 'Enter') login();
+    });
+    
+    function login() {
+      var username = document.getElementById('username').value;
+      var password = document.getElementById('password').value;
+      var errorDiv = document.getElementById('error');
+      
+      fetch('/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: 'username=' + encodeURIComponent(username) + '&password=' + encodeURIComponent(password)
+      })
+      .then(function(response) { return response.json(); })
+      .then(function(data) {
+        if (data.success) {
+          window.location.href = '/dashboard';
+        } else {
+          errorDiv.textContent = data.message || 'Invalid credentials';
+          errorDiv.style.display = 'block';
+        }
+      })
+      .catch(function(err) {
+        errorDiv.textContent = 'Connection error';
+        errorDiv.style.display = 'block';
+      });
+    }
+  </script>
+</body>
+</html>
+)=====";
+const char HTML_DASHBOARD[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vehicle Tracker Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+      min-height: 100vh;
+    }
+    .header {
+      background: white;
+      padding: 20px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    .header-content {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 15px;
+    }
+    .logo-section {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+    }
+    .logo-icon {
+      width: 50px;
+      height: 50px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+    }
+    h1 { font-size: 24px; color: #333; }
+    .subtitle { font-size: 12px; color: #666; }
+    .btn-group { display: flex; gap: 10px; }
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 14px;
+      transition: all 0.3s;
+    }
+    .btn-refresh { background: #667eea; color: white; }
+    .btn-refresh:hover { background: #5568d3; }
+    .btn-logout { background: #f44336; color: white; }
+    .btn-logout:hover { background: #d32f2f; }
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 20px;
+      margin-bottom: 30px;
+    }
+    .stat-card {
+      background: white;
+      padding: 25px;
+      border-radius: 15px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+      border-left: 4px solid;
+      transition: transform 0.3s;
+    }
+    .stat-card:hover { transform: translateY(-5px); }
+    .stat-card.blue { border-color: #2196F3; }
+    .stat-card.green { border-color: #4CAF50; }
+    .stat-card.purple { border-color: #9C27B0; }
+    .stat-card.orange { border-color: #FF9800; }
+    .stat-label { color: #666; font-size: 14px; margin-bottom: 8px; }
+    .stat-value { font-size: 32px; font-weight: bold; color: #333; }
+    .table-container {
+      background: white;
+      border-radius: 15px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+      overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    thead {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+    th {
+      padding: 18px;
+      text-align: left;
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    td {
+      padding: 18px;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 14px;
+    }
+    tbody tr { transition: all 0.2s; }
+    tbody tr:hover {
+      background: linear-gradient(90deg, #eff6ff 0%, #dbeafe 100%);
+      transform: scale(1.01);
+    }
+    .vehicle-id { font-weight: 600; color: #2196F3; }
+    .fastag {
+      font-family: monospace;
+      background: #f5f5f5;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .distance { color: #4CAF50; font-weight: 600; }
+    .fare {
+      background: #f3e5f5;
+      color: #9C27B0;
+      padding: 4px 12px;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+    .no-data {
+      text-align: center;
+      padding: 60px 20px;
+      color: #999;
+      font-size: 18px;
+    }
+    .info-box {
+      background: #e3f2fd;
+      border-left: 4px solid #2196F3;
+      padding: 15px;
+      border-radius: 8px;
+      margin-top: 20px;
+      font-size: 14px;
+      color: #666;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .spinning { animation: spin 1s linear infinite; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-content">
+      <div class="logo-section">
+        <div class="logo-icon">🚗</div>
+        <div>
+          <h1>Vehicle Tracker Dashboard</h1>
+          <div class="subtitle">Real-time monitoring system</div>
+        </div>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-refresh" onclick="refreshData()">
+          <span id="refresh-icon">🔄</span> Refresh
+        </button>
+        <button class="btn btn-logout" onclick="logout()">🚪 Logout</button>
+      </div>
+    </div>
+  </div>
+  
+  <div class="container">
+    <div class="stats">
+      <div class="stat-card blue">
+        <div class="stat-label">Total Vehicles</div>
+        <div class="stat-value" id="total-vehicles">0</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-label">Total Distance</div>
+        <div class="stat-value" id="total-distance">0 km</div>
+      </div>
+      <div class="stat-card purple">
+        <div class="stat-label">Total Revenue</div>
+        <div class="stat-value" id="total-revenue">₹0</div>
+      </div>
+      <div class="stat-card orange">
+        <div class="stat-label">Rate/km</div>
+        <div class="stat-value">₹5</div>
+      </div>
+    </div>
+    
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>S.No</th>
+            <th>🚗 Vehicle ID</th>
+            <th>🏷️ FASTag ID</th>
+            <th>📍 Distance (km)</th>
+            <th>🕒 Last Update</th>
+            <th>💰 Total Fare (₹)</th>
+          </tr>
+        </thead>
+        <tbody id="vehicle-table">
+          <tr><td colspan="6" class="no-data">No vehicle data received yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+    
+    <div class="info-box">
+      <strong>Note:</strong> Rate calculation is ₹5 per kilometer. Data updates in real-time from ESP-NOW receivers.
+    </div>
+  </div>
+  
+  <script>
+    function updateDashboard(data) {
+      document.getElementById('total-vehicles').textContent = data.vehicle_count;
+      document.getElementById('total-distance').textContent = data.total_distance.toFixed(0) + ' km';
+      document.getElementById('total-revenue').textContent = '₹' + data.total_revenue.toFixed(0);
+      
+      var tbody = document.getElementById('vehicle-table');
+      if (data.vehicles.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="no-data">No vehicle data received yet</td></tr>';
+        return;
+      }
+      
+      tbody.innerHTML = '';
+      for(var i=0; i<data.vehicles.length; i++) {
+        var v = data.vehicles[i];
+        var row = tbody.insertRow();
+        row.innerHTML = '<td>' + (i + 1) + '</td>' +
+          '<td><span class="vehicle-id">' + v.id + '</span></td>' +
+          '<td><span class="fastag">' + v.fastag + '</span></td>' +
+          '<td><span class="distance">' + v.distance.toFixed(2) + ' km</span></td>' +
+          '<td>' + v.time + '</td>' +
+          '<td><span class="fare">₹' + v.fare + '</span></td>';
+      }
+    }
+    
+    function refreshData() {
+      var icon = document.getElementById('refresh-icon');
+      icon.classList.add('spinning');
+      
+      fetch('/api/vehicles')
+        .then(function(response) { return response.json(); })
+        .then(function(data) {
+          updateDashboard(data);
+          setTimeout(function() { icon.classList.remove('spinning'); }, 1000);
+        })
+        .catch(function(err) {
+          console.error('Error:', err);
+          icon.classList.remove('spinning');
+        });
+    }
+    
+    function logout() {
+      fetch('/logout')
+        .then(function() { window.location.href = '/'; })
+        .catch(function() { window.location.href = '/'; });
+    }
+    
+    setInterval(refreshData, 5000);
+    refreshData();
+  </script>
+</body>
+</html>
+)=====";
+
+void handleRoot() {
+  if (isAuthenticated) {
+    server.sendHeader("Location", "/dashboard");
+    server.send(303);
+  } else {
+    server.send(200, "text/html", HTML_LOGIN);
+  }
+}
+
+void handleLogin() {
+  if (server.method() == HTTP_POST) {
+    String user = server.arg("username");
+    String pass = server.arg("password");
+    
+    StaticJsonDocument<128> doc;
+    
+    if (user == web_username && pass == web_password) {
+      isAuthenticated = true;
+      sessionToken = String(millis());
+      doc["success"] = true;
+      doc["message"] = "Login successful";
+    } else {
+      doc["success"] = false;
+      doc["message"] = "Invalid credentials";
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  }
+}
+
+void handleDashboard() {
+  if (!isAuthenticated) {
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+  server.send(200, "text/html", HTML_DASHBOARD);
+}
+
+void handleLogout() {
+  isAuthenticated = false;
+  sessionToken = "";
+  server.send(200, "text/plain", "OK");
+}
+
+void handleVehicleAPI() {
+  if (!isAuthenticated) {
+    server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+  
+  DynamicJsonDocument doc(4096);
+  
+  doc["vehicle_count"] = vehicle_count;
+  
+  double total_dist = 0;
+  double total_rev = 0;
+  
+  JsonArray vehicles_array = doc.createNestedArray("vehicles");
+  
+  for (int i = 0; i < vehicle_count; i++) {
+    JsonObject v = vehicles_array.createNestedObject();
+    
+    double dist_km = vehicles[i].total_distance_m / 1000.0;
+    double fare = dist_km * RATE_PER_KM;
+    
+    total_dist += dist_km;
+    total_rev += fare;
+    
+    v["id"] = vehicles[i].vehicle_id;
+    v["fastag"] = vehicles[i].fastag;
+    v["distance"] = dist_km;
+    v["fare"] = String(fare, 2);
+    
+    unsigned long age_sec = (millis() - vehicles[i].last_update_ms) / 1000;
+    v["time"] = String(age_sec) + "s ago";
+  }
+  
+  doc["total_distance"] = total_dist;
+  doc["total_revenue"] = total_rev;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Wire.begin(4, 5);
+  initOLED();
+  displayWaiting();
+  
+  Serial.println("\n\n========================================");
+  Serial.println("VEHICLE NH TRACKER - WEB SERVER");
+  Serial.println("NodeMCU ESP8266 with ESP-NOW");
+  Serial.println("========================================\n");
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Access Dashboard at: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi Connection Failed!");
+  }
+  
+  if (esp_now_init() != 0) {
+    Serial.println("ESP-NOW init FAILED");
+    return;
+  }
+  
+  Serial.println("ESP-NOW >> Initialized");
+  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+  esp_now_register_recv_cb(onDataRecv);
+  Serial.println("ESP-NOW >> Set as SLAVE, waiting for data...");
+  
+  server.on("/", handleRoot);
+  server.on("/login", handleLogin);
+  server.on("/dashboard", handleDashboard);
+  server.on("/logout", handleLogout);
+  server.on("/api/vehicles", handleVehicleAPI);
+  
+  server.begin();
+  Serial.println("Web Server >> Started");
+  
+  Serial.println("\n========================================");
+  Serial.println("SYSTEM READY");
+  Serial.println("========================================\n");
+  
+  memset(vehicles, 0, sizeof(vehicles));
+}
+
+void loop() {
+  server.handleClient();
+  
+  if (dstate.show_data && dstate.display_index >= 0) {
+    if (millis() - dstate.display_time < 5000) {
+      displayReceivedData(dstate.display_index);
+    } else {
+      dstate.show_data = false;
+      dstate.display_index = -1;
+      displayWaiting();
+    }
+  } else if (!dstate.show_data) {
+    displayWaiting();
+  }
+  
+  delay(10);
+}
